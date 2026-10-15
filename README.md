@@ -121,18 +121,25 @@ gcc -O3 -fPIC -c tcp_sync.c -o tcp_sync.o
 zig build-exe gpu_roce_harness.zig tp2_layer_kernel.o roce_proxy.o tcp_sync.o \
   -L/usr/local/cuda-13.0/lib64 -lcudart -lstdc++ -lc -libverbs -lpthread -O ReleaseFast
 
-# Build Phase 3 TP=2 Transformer Layer Harness
-zig build-exe tp2_layer_harness.zig tp2_layer_kernel.o roce_proxy.o tcp_sync.o \
+# Build Phase 4 Pure Zig GLM-5.3-Flash Serving Engine
+/usr/local/cuda-13.0/bin/nvcc -O3 -arch=sm_121 -Xcompiler -fPIC -c glm_ops.cu -o glm_ops.o
+zig build-exe glm53_serving_engine.zig glm_ops.o roce_proxy.o tcp_sync.o \
   -L/usr/local/cuda-13.0/lib64 -lcublas -lcudart -lstdc++ -lc -libverbs -lpthread -O ReleaseFast
 ```
 
-### 3. Launch TP=2 Forward Pass Across Cluster
+### 3. Launch Pure Zig Serving Engine (OpenAI API on :8889)
 ```bash
-# On Rank 0 (Head Node: 10.10.7.4):
-./tp2_layer_harness --rank 0 --port 29779
+# On Rank 1 (Worker: 10.10.7.5):
+./glm53_serving_engine --rank 1 --peer-ip 10.10.7.4 --roce-port 29779
 
-# On Rank 1 (Worker Node):
-./tp2_layer_harness --rank 1 --peer-ip 10.10.7.4 --port 29779
+# On Rank 0 (Head: 10.10.7.4):
+./glm53_serving_engine --rank 0 --roce-port 29779 --port 8889
+
+# Test from any node on the cluster or Tailnet:
+curl -s http://localhost:8889/health | jq .
+curl -s -N -X POST http://localhost:8889/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "glm-5.3-flash-2", "messages": [{"role": "user", "content": "Hello!"}], "stream": true}'
 ```
 
 ---
