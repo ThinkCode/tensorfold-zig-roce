@@ -86,6 +86,7 @@ extern "c" fn accept(sockfd: c_int, addr: ?*anyopaque, addrlen: ?*c_uint) c_int;
 extern "c" fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: c_uint) c_int;
 extern "c" fn recv(sockfd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
 extern "c" fn send(sockfd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
+extern "c" fn shutdown(sockfd: c_int, how: c_int) c_int;
 
 const AF_INET: c_int = 2;
 const SOCK_STREAM: c_int = 1;
@@ -116,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
     var rank: c_int = 0;
     var peer_ip: [*:0]const u8 = "10.10.7.4";
     var roce_port: c_int = 29779;
-    var http_port: u16 = 8889;
+    var http_port: u16 = 8888;
     var benchmark_only: bool = false;
 
     var i: usize = 1;
@@ -332,6 +333,10 @@ pub fn main(init: std.process.Init) !void {
         if (rank == 1 and !benchmark_only) {
             // Keep worker loop alive to serve incoming requests from rank 0
             while (true) {
+                var trigger: [1]u8 = undefined;
+                const n_trig = recv(sync_fd, &trigger, 1, 0);
+                if (n_trig <= 0) break;
+
                 const shard_packs: c_int = @intCast(rank_act_bytes / 16);
                 const row_packs: c_int = shard_packs;
                 _ = launch_roce_gather(
@@ -397,13 +402,19 @@ pub fn main(init: std.process.Init) !void {
             const client_fd = accept(server_fd, null, null);
             if (client_fd < 0) continue;
 
-            const n_read = recv(client_fd, &req_buffer, req_buffer.len, 0);
-            if (n_read <= 0) {
+            var total_read: usize = 0;
+            while (total_read < req_buffer.len) {
+                const n = recv(client_fd, req_buffer[total_read..].ptr, req_buffer.len - total_read, 0);
+                if (n <= 0) break;
+                total_read += @intCast(n);
+                if (std.mem.indexOf(u8, req_buffer[0..total_read], "\r\n\r\n") != null) break;
+            }
+            if (total_read == 0) {
                 _ = close(client_fd);
                 continue;
             }
 
-            const req_str = req_buffer[0..@intCast(n_read)];
+            const req_str = req_buffer[0..total_read];
 
             if (std.mem.startsWith(u8, req_str, "GET /health")) {
                 const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":true,\"backend\":\"pure_zig_tensorfold\",\"model\":\"glm-5.3-flash-2\",\"engine\":\"zig-0.17.0\",\"roce_rails\":2,\"requests_running\":0,\"requests_total\":1,\"pool_tokens\":2480000,\"pool_free_tokens\":2340000}\n";
@@ -412,6 +423,9 @@ pub fn main(init: std.process.Init) !void {
                 const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"object\":\"list\",\"data\":[{\"id\":\"glm-5.3-flash-2\",\"object\":\"model\",\"owned_by\":\"pure-zig-tensorfold\"}]}\n";
                 _ = send(client_fd, resp.ptr, resp.len, 0);
             } else if (std.mem.startsWith(u8, req_str, "POST /v1/chat/completions")) {
+                // Wake up rank 1 worker over synchronized TCP rendezvous socket
+                _ = send(sync_fd, "\x01", 1, 0);
+
                 // Execute hardware forward pass across twin CX7 RoCE rails
                 const shard_packs: c_int = @intCast(rank_act_bytes / 16);
                 const row_packs: c_int = shard_packs;
@@ -465,6 +479,7 @@ pub fn main(init: std.process.Init) !void {
                 _ = send(client_fd, not_found.ptr, not_found.len, 0);
             }
 
+            _ = shutdown(client_fd, 1);
             _ = close(client_fd);
         }
     }
